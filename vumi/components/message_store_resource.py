@@ -1,5 +1,7 @@
 # -*- test-case-name: vumi.components.tests.test_message_store_resource -*-
 
+import iso8601
+
 from twisted.application.internet import StreamServerEndpointService
 from twisted.internet.defer import DeferredList, inlineCallbacks
 from twisted.web.resource import NoResource, Resource
@@ -10,6 +12,7 @@ from vumi.components.message_formatters import JsonFormatter, CsvFormatter
 from vumi.config import (
     ConfigDict, ConfigText, ConfigServerEndpoint, ConfigInt,
     ServerEndpointFallback)
+from vumi.message import VUMI_DATE_FORMAT
 from vumi.persist.txriak_manager import TxRiakManager
 from vumi.persist.txredis_manager import TxRedisManager
 from vumi.transports.httprpc import httprpc
@@ -25,6 +28,13 @@ def chunks(l, n):
         yield l[i:i + n]
 
 
+class ParameterError(Exception):
+    """
+    Exception raised while trying to parse a parameter.
+    """
+    pass
+
+
 class MessageStoreProxyResource(Resource):
 
     isLeaf = True
@@ -36,20 +46,51 @@ class MessageStoreProxyResource(Resource):
         self.batch_id = batch_id
         self.formatter = formatter
 
-    def render_GET(self, request):
-        self.formatter.add_http_headers(request)
-        self.formatter.write_row_header(request)
+    def _extract_date_arg(self, request, argname):
+        if argname not in request.args:
+            return None
+        if len(request.args[argname]) > 1:
+            raise ParameterError(
+                "Invalid '%s' parameter: Too many values" % (argname,))
+        [value] = request.args[argname]
+        try:
+            timestamp = iso8601.parse_date(value)
+            return timestamp.strftime(VUMI_DATE_FORMAT)
+        except iso8601.ParseError as e:
+            raise ParameterError(
+                "Invalid '%s' parameter: %s" % (argname, str(e)))
 
+    def render_GET(self, request):
         if 'concurrency' in request.args:
             concurrency = int(request.args['concurrency'][0])
         else:
             concurrency = self.default_concurrency
 
-        d = self.get_keys_page(self.message_store, self.batch_id)
+        try:
+            start = self._extract_date_arg(request, 'start')
+            end = self._extract_date_arg(request, 'end')
+        except ParameterError as e:
+            request.setResponseCode(400)
+            return str(e)
+
+        self.formatter.add_http_headers(request)
+        self.formatter.write_row_header(request)
+
+        if not (start or end):
+            d = self.get_keys_page(self.message_store, self.batch_id)
+        else:
+            d = self.get_keys_page_for_time(
+                self.message_store, self.batch_id, start, end)
+        request.connection_has_been_closed = False
+        request.notifyFinish().addBoth(
+            lambda _: setattr(request, 'connection_has_been_closed', True))
         d.addCallback(self.fetch_pages, concurrency, request)
         return NOT_DONE_YET
 
     def get_keys_page(self, message_store, batch_id):
+        raise NotImplementedError('To be implemented by sub-class.')
+
+    def get_keys_page_for_time(self, message_store, batch_id, start, end):
         raise NotImplementedError('To be implemented by sub-class.')
 
     def get_message(self, message_store, message_id):
@@ -66,6 +107,9 @@ class MessageStoreProxyResource(Resource):
 
         When there are no more pages, we add a callback to close the request.
         """
+        if request.connection_has_been_closed:
+            # We're no longer connected, so stop doing work.
+            return
         d = self.fetch_page(keys_page, concurrency, request)
         if keys_page.has_next_page():
             # We fetch the next page before waiting for the current page to be
@@ -77,8 +121,14 @@ class MessageStoreProxyResource(Resource):
             d.addCallback(self.fetch_pages, concurrency, request)
         else:
             # No more pages, so close the request.
-            d.addCallback(lambda _: request.finish())
+            d.addCallback(self.finish_request_cb, request)
         return d
+
+    def finish_request_cb(self, _result, request):
+        if not request.connection_has_been_closed:
+            # We need to check for this here in case we lose the connection
+            # while delivering the last page.
+            return request.finish()
 
     @inlineCallbacks
     def fetch_page(self, keys_page, concurrency, request):
@@ -86,6 +136,9 @@ class MessageStoreProxyResource(Resource):
         Process a page of keys in chunks of concurrently-fetched messages.
         """
         for keys in chunks(list(keys_page), concurrency):
+            if request.connection_has_been_closed:
+                # We're no longer connected, so stop doing work.
+                return
             yield self.handle_chunk(keys, request)
 
     def handle_chunk(self, message_keys, request):
@@ -109,6 +162,11 @@ class InboundResource(MessageStoreProxyResource):
     def get_keys_page(self, message_store, batch_id):
         return message_store.batch_inbound_keys_page(batch_id)
 
+    def get_keys_page_for_time(self, message_store, batch_id, start, end):
+        return message_store.batch_inbound_keys_with_timestamps(
+            batch_id, max_results=message_store.DEFAULT_MAX_RESULTS,
+            start=start, end=end, with_timestamps=False)
+
     def get_message(self, message_store, message_id):
         return message_store.get_inbound_message(message_id)
 
@@ -117,6 +175,11 @@ class OutboundResource(MessageStoreProxyResource):
 
     def get_keys_page(self, message_store, batch_id):
         return message_store.batch_outbound_keys_page(batch_id)
+
+    def get_keys_page_for_time(self, message_store, batch_id, start, end):
+        return message_store.batch_outbound_keys_with_timestamps(
+            batch_id, max_results=message_store.DEFAULT_MAX_RESULTS,
+            start=start, end=end, with_timestamps=False)
 
     def get_message(self, message_store, message_id):
         return message_store.get_outbound_message(message_id)

@@ -329,6 +329,32 @@ class Model(object):
             cls, index_name, start_value, end_value, return_terms=return_terms)
 
     @classmethod
+    def all_keys_page(cls, manager, max_results=None, continuation=None):
+        """Return all keys in this model's bucket.
+
+        Uses Riak's special `$bucket` index. Beware of tombstones (i.e.
+        the keys returned might have been deleted from Riak in the near past).
+
+        :param int max_results:
+            The maximum number of results to return per page. If ``None``,
+            pagination will disables and a single page containing all results
+            will be returned.
+
+        :param continuation:
+            An opaque continuation token indicating which page of results to
+            fetch. The index page object returned from this method has a
+            ``continuation`` attribute that contains this value. If ``None``,
+            the first page of results will be returned.
+
+        :returns:
+            :class:`VumiIndexPage` or :class:`VumiTxIndexPage` object
+            containing all keys from this model's bucket.
+        """
+        return manager.index_keys_page(
+            cls, '$bucket', manager.bucket_name(cls), None,
+            max_results=max_results, continuation=continuation)
+
+    @classmethod
     def index_keys_page(cls, manager, field_name, value, end_value=None,
                         return_terms=None, max_results=None,
                         continuation=None):
@@ -434,13 +460,13 @@ class Model(object):
         return manager.mr_from_search(cls, query)
 
     @classmethod
-    def real_search(cls, manager, query, rows=None):
+    def real_search(cls, manager, query, rows=None, start=None):
         """
         Performs a real riak search, does no inspection on the given query.
 
         :returns: list of keys.
         """
-        return manager.real_search(cls, query, rows=rows)
+        return manager.real_search(cls, query, rows=rows, start=start)
 
     @classmethod
     def enable_search(cls, manager):
@@ -816,7 +842,7 @@ class Manager(object):
     def mr_from_keys(self, model, keys):
         return VumiMapReduce.from_keys(self, model, keys)
 
-    def real_search(self, model, query, rows=None):
+    def real_search(self, model, query, rows=None, start=None):
         raise NotImplementedError()
 
     def riak_enable_search(self, model):
@@ -857,6 +883,10 @@ class ModelProxy(object):
             self._manager, field_name, value, end_value,
             return_terms=return_terms)
 
+    def all_keys_page(self, max_results=None, continuation=None):
+        return self._modelcls.all_keys_page(
+            self._manager, max_results=max_results, continuation=continuation)
+
     def index_keys_page(self, field_name, value, end_value=None,
                         return_terms=None, max_results=None,
                         continuation=None):
@@ -878,8 +908,9 @@ class ModelProxy(object):
     def raw_search(self, query):
         return self._modelcls.raw_search(self._manager, query)
 
-    def real_search(self, query, rows=None):
-        return self._modelcls.real_search(self._manager, query, rows=rows)
+    def real_search(self, query, rows=None, start=None):
+        return self._modelcls.real_search(
+            self._manager, query, rows=rows, start=start)
 
     def enable_search(self):
         return self._modelcls.enable_search(self._manager)

@@ -391,6 +391,26 @@ class TestModelOnTxRiak(VumiTestCase):
         yield self.assert_search_results([], search, 'a:7')
 
     @Manager.calls_manager
+    def test_limited_results_real_search(self):
+        simple_model = self.manager.proxy(SimpleModel)
+        yield simple_model.enable_search()
+        yield simple_model("1one", a=1, b=u'abc').save()
+        yield simple_model("2two", a=2, b=u'def').save()
+        yield simple_model("3three", a=2, b=u'ghi').save()
+        yield simple_model("4four", a=2, b=u'jkl').save()
+
+        @inlineCallbacks
+        def search(q):
+            results = yield simple_model.real_search(q, rows=2, start=0)
+            self.assertEqual(len(results), 2)
+            results_new = yield simple_model.real_search(q, rows=2, start=2)
+            self.assertEqual(len(results_new), 1)
+            returnValue(results + results_new)
+
+        yield self.assert_search_results(
+            [u'2two', u'3three', u'4four'], search, 'a:2')
+
+    @Manager.calls_manager
     def test_load_all_bunches(self):
         self.assertFalse(self.manager.USE_MAPREDUCE_BUNCH_LOADING)
         simple_model = self.manager.proxy(SimpleModel)
@@ -593,6 +613,46 @@ class TestModelOnTxRiak(VumiTestCase):
 
         keys = yield indexed_model.index_keys('a', 2, 3, return_terms=True)
         self.assertEqual(sorted(keys), [("2", "foo2"), ("3", "foo3")])
+
+    @Manager.calls_manager
+    def test_all_keys_page(self):
+        simple_model = self.manager.proxy(SimpleModel)
+
+        keys_page = yield simple_model.all_keys_page()
+        keys = yield self.filter_tombstones(simple_model, list(keys_page))
+        self.assertEqual(keys, [])
+
+        yield simple_model("foo-1", a=5, b=u'1').save()
+        yield simple_model("foo-2", a=5, b=u'2').save()
+
+        keys_page = yield simple_model.all_keys_page()
+        keys = yield self.filter_tombstones(simple_model, list(keys_page))
+        self.assertEqual(sorted(keys), [u"foo-1", u"foo-2"])
+
+    @Manager.calls_manager
+    def test_all_keys_page_multiple_pages(self):
+        simple_model = self.manager.proxy(SimpleModel)
+
+        yield simple_model("foo-1", a=5, b=u'1').save()
+        yield simple_model("foo-2", a=5, b=u'2').save()
+
+        keys = []
+
+        # We get results in arbitrary order and we may have tombstones left
+        # over from prior tests. Therefore, we iterate through all index pages
+        # and assert that we have exactly one result in each page except the
+        # last.
+        keys_page = yield simple_model.all_keys_page(max_results=1)
+        while keys_page is not None:
+            keys.extend(list(keys_page))
+            if keys_page.has_next_page():
+                self.assertEqual(len(list(keys_page)), 1)
+                keys_page = yield keys_page.next_page()
+            else:
+                keys_page = None
+
+        keys = yield self.filter_tombstones(simple_model, keys)
+        self.assertEqual(sorted(keys), [u"foo-1", u"foo-2"])
 
     @Manager.calls_manager
     def test_index_keys_page(self):

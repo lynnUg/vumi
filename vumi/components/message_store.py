@@ -63,13 +63,24 @@ class CurrentTag(Model):
 
 
 class OutboundMessage(Model):
-
-    VERSION = 1
+    VERSION = 2
     MIGRATOR = OutboundMessageMigrator
 
     # key is message_id
     msg = VumiMessage(TransportUserMessage)
     batches = ManyToMany(Batch)
+
+    # Extra fields for compound indexes
+    batches_with_timestamps = ListOf(Unicode(), index=True)
+
+    def save(self):
+        # We override this method to set our index fields before saving.
+        batches_with_timestamps = []
+        timestamp = self.msg['timestamp']
+        for batch_id in self.batches.keys():
+            batches_with_timestamps.append(u"%s$%s" % (batch_id, timestamp))
+        self.batches_with_timestamps = batches_with_timestamps
+        return super(OutboundMessage, self).save()
 
 
 class Event(Model):
@@ -79,13 +90,24 @@ class Event(Model):
 
 
 class InboundMessage(Model):
-
-    VERSION = 1
+    VERSION = 2
     MIGRATOR = InboundMessageMigrator
 
     # key is message_id
     msg = VumiMessage(TransportUserMessage)
     batches = ManyToMany(Batch)
+
+    # Extra fields for compound indexes
+    batches_with_timestamps = ListOf(Unicode(), index=True)
+
+    def save(self):
+        # We override this method to set our index fields before saving.
+        batches_with_timestamps = []
+        timestamp = self.msg['timestamp']
+        for batch_id in self.batches.keys():
+            batches_with_timestamps.append(u"%s$%s" % (batch_id, timestamp))
+        self.batches_with_timestamps = batches_with_timestamps
+        return super(InboundMessage, self).save()
 
 
 class MessageStore(object):
@@ -486,3 +508,136 @@ class MessageStore(object):
         """
         return self.cache.get_outbound_message_keys(
             batch_id, start, stop, with_timestamp=with_timestamp)
+
+    def _start_end_values(self, batch_id, start, end):
+        if start is not None:
+            start_value = "%s$%s" % (batch_id, start)
+        else:
+            start_value = "%s%s" % (batch_id, "#")  # chr(ord('$') - 1)
+        if end is not None:
+            end_value = "%s$%s" % (batch_id, end)
+        else:
+            end_value = "%s%s" % (batch_id, "%")  # chr(ord('$') + 1)
+        return start_value, end_value
+
+    @Manager.calls_manager
+    def batch_inbound_keys_with_timestamps(self, batch_id, max_results=None,
+                                           start=None, end=None,
+                                           with_timestamps=True):
+        """
+        Return all inbound message keys with (and ordered by) timestamps.
+
+        :param str batch_id:
+            The batch_id to fetch keys for.
+
+        :param int max_results:
+            Number of results per page. Defaults to DEFAULT_MAX_RESULTS
+
+        :param str start:
+            Optional start timestamp string matching VUMI_DATE_FORMAT.
+
+        :param str end:
+            Optional end timestamp string matching VUMI_DATE_FORMAT.
+
+        :param bool with_timestamps:
+            If set to ``False``, only the keys will be returned. The results
+            will still be ordered by timestamp, however.
+
+        This method performs a Riak index query.
+        """
+        if max_results is None:
+            max_results = self.DEFAULT_MAX_RESULTS
+        start_value, end_value = self._start_end_values(batch_id, start, end)
+        results = yield self.inbound_messages.index_keys_page(
+            'batches_with_timestamps', start_value, end_value,
+            return_terms=with_timestamps, max_results=max_results)
+        if with_timestamps:
+            results = KeysWithTimestamps(self, batch_id, results)
+        returnValue(results)
+
+    @Manager.calls_manager
+    def batch_outbound_keys_with_timestamps(self, batch_id, max_results=None,
+                                            start=None, end=None,
+                                            with_timestamps=True):
+        """
+        Return all outbound message keys with (and ordered by) timestamps.
+
+        :param str batch_id:
+            The batch_id to fetch keys for.
+
+        :param int max_results:
+            Number of results per page. Defaults to DEFAULT_MAX_RESULTS
+
+        :param str start:
+            Optional start timestamp string matching VUMI_DATE_FORMAT.
+
+        :param str end:
+            Optional end timestamp string matching VUMI_DATE_FORMAT.
+
+        :param bool with_timestamps:
+            If set to ``False``, only the keys will be returned. The results
+            will still be ordered by timestamp, however.
+
+        This method performs a Riak index query.
+        """
+        if max_results is None:
+            max_results = self.DEFAULT_MAX_RESULTS
+        start_value, end_value = self._start_end_values(batch_id, start, end)
+        results = yield self.outbound_messages.index_keys_page(
+            'batches_with_timestamps', start_value, end_value,
+            return_terms=with_timestamps, max_results=max_results)
+        if with_timestamps:
+            results = KeysWithTimestamps(self, batch_id, results)
+        returnValue(results)
+
+
+class KeysWithTimestamps(object):
+    """
+    Index page that reformats results into something easier to work with.
+
+    This is a wrapper around the lower-level index page object from Riak and
+    proxies a subset of its functionality.
+
+    TODO: This is currently written specifically for batch_id+timestamp
+          indexes, but the intent is to generalise it to any kind of compound
+          index once we've figured out a good way to do those.
+    """
+    def __init__(self, message_store, batch_id, index_page):
+        self._message_store = message_store
+        self.manager = message_store.manager
+        self._batch_id = batch_id
+        self._index_page = index_page
+
+    @Manager.calls_manager
+    def next_page(self):
+        """
+        Fetch the next page of results.
+
+        :returns:
+            A new :class:`KeysWithTimestamps` object containing the next page
+            of results.
+        """
+        next_page = yield self._index_page.next_page()
+        returnValue(type(self)(self._message_store, self._batch_id, next_page))
+
+    def has_next_page(self):
+        """
+        Indicate whether there are more results to follow.
+
+        :returns:
+            ``True`` if there are more results, ``False`` if this is the last
+            page.
+        """
+        return self._index_page.has_next_page()
+
+    def __iter__(self):
+        return (self._format_result(r) for r in self._index_page)
+
+    def _format_result(self, result):
+        value, key = result
+        prefix = self._batch_id + "$"
+        if not value.startswith(prefix):
+            raise ValueError(
+                "Index value %r does not begin with expected prefix %r." % (
+                    value, prefix))
+        return (key, value[len(prefix):])
