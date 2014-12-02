@@ -34,7 +34,7 @@ setup(
         'wokkel',
         'redis>=2.7.1',
         'txredis',
-        'python-smpp>=0.1.2',
+        'python-smpp==0.1.4',
         'pytz==2013b',
         'riak>=2.1',
         'txJSON-RPC==0.3.1',
